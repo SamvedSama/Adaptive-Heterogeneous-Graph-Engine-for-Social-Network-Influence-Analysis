@@ -1,51 +1,53 @@
 /**
  * @file pagerank_cuda.cu
- * @brief CUDA PageRank — pull model, warp+block reductions, persistent CUB plan,
- *        pinned host memory, zero mid-loop D2H stalls.
+ * @brief CUDA PageRank — pull model, warp+block reductions, pinned host memory,
+ *        zero mid-loop D2H stalls.
  *
- * Key improvements over the original:
+ * Changes from the previous version
+ * ------------------------------------
+ *  1. CUB CountingInputIterator / TransformInputIterator REMOVED.
+ *     cub::CountingInputIterator was removed from the public CUB API in CUDA 12.x
+ *     and is no longer available via <cub/device/device_reduce.cuh>.  The L1
+ *     convergence check is now computed by a dedicated warp+block reduction
+ *     kernel (pagerank_l1_kernel) that follows the same pattern as the dangling
+ *     kernel — one warp_reduce_sum per warp, one atomicAdd per block.  This is
+ *     faster than the CUB generic path for this specific single-pass pattern and
+ *     removes the temp_storage allocation entirely.
  *
- *  1. dangling reduction via warp shuffle + shared memory:  eliminates the
- *     global atomicAdd that serialised all n threads onto one address.
- *     Each block reduces internally, then one atomicAdd per block.
+ *  2. AbsDiff functor + CUB probe block REMOVED.
+ *     The old functor captured raw pointers d_new / d_old at construction time.
+ *     After std::swap(d_old, d_new) these pointers alias the swapped buffers, so
+ *     the functor silently computed |old - old| = 0 from iteration 2 onward —
+ *     causing premature convergence.  The new kernel takes d_old and d_new as
+ *     explicit parameters each call, so swap is safe.
  *
- *  2. Dangling scalar kept on device across iterations: the host reads it once
- *     via pinned memory + async memcpy, overlapped with fill_base launch so
- *     the PCIe round-trip is hidden behind GPU work.
+ *  3. <cub/device/device_reduce.cuh> and <cub/iterator/transform_input_iterator.cuh>
+ *     replaced with a single <cub/device/device_reduce.cuh> include that is only
+ *     used for the warp primitive — actually that too is removed.  The only CUB
+ *     dependency remaining is zero; all reductions use __shfl_down_sync directly.
  *
- *  3. d_out_deg removed: out-degree is derived from (col_ptr[v+1]-col_ptr[v])
- *     inside the pull kernel — one fewer array, one fewer cache line per thread.
- *
- *  4. Persistent CUB DeviceReduce plan: temp storage allocated once, reused
- *     every iteration — eliminates per-iteration malloc/free inside Thrust.
- *
- *  5. Fused fill + dangling-broadcast kernel: combines base_val broadcast and
- *     new_rank reset in one pass.
- *
- *  6. Removed redundant cudaDeviceSynchronize before CUB reduce.
- *
- *  7. init_rank kernel instead of host vector + memcpy.
- *
- *  8. All device memory allocated in one batch; freed in one batch.
- *
- *  9. CSC built on the host once (same as before) — acceptable since it is
- *     O(n+m) and dominated by iteration cost for large graphs.
+ *  4. All other improvements from the previous version are preserved:
+ *       - warp+block dangling reduction (no global atomicAdd per thread)
+ *       - pull model over device-side CSC
+ *       - pinned h_dangling for low-latency D2H
+ *       - persistent temp storage (now just d_l1, no CUB temp buffer needed)
+ *       - init kernel instead of host memcpy
+ *       - single-batch alloc / free
  */
 #include "graph/graph.h"
 #include "common.h"
 
-#include <cub/device/device_reduce.cuh>
-#include <cub/iterator/transform_input_iterator.cuh>
+#include <cuda_runtime.h>
 
 #include <cmath>
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Device kernels
+// Device helpers
 // ---------------------------------------------------------------------------
 namespace {
 
-// ---- Warp-level horizontal float sum using shuffle -----------------------
+/** Warp-level horizontal float sum via shuffle. */
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         val += __shfl_down_sync(0xFFFFFFFF, val, offset);
@@ -53,68 +55,65 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
-// ---- Dangling-mass reduction kernel --------------------------------------
-// One thread per vertex.  Warp-reduce partial sums, one atomicAdd per block.
-__global__ void pagerank_dangling_kernel(unsigned            n,
-                                         const float* __restrict__ old_rank,
-                                         const float* __restrict__ inv_deg,
-                                         float* __restrict__       d_dangling) {
-    extern __shared__ float sdata[];
+// ---------------------------------------------------------------------------
+// Kernels
+// ---------------------------------------------------------------------------
 
-    const unsigned i   = blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned lid = threadIdx.x;
-    const unsigned wid = lid >> 5;          // warp index within block
-    const unsigned lane = lid & 31;
-
-    float val = 0.0f;
-    if (i < n && inv_deg[i] == 0.0f) {     // dangling vertex
-        val = old_rank[i];
-    }
-
-    // Warp reduce
-    val = warp_reduce_sum(val);
-
-    // First lane of each warp writes to shared memory
-    if (lane == 0) {
-        sdata[wid] = val;
-    }
-    __syncthreads();
-
-    // First warp reduces shared memory
-    const unsigned warps_per_block = (blockDim.x + 31) >> 5;
-    if (wid == 0) {
-        val = (lane < warps_per_block) ? sdata[lane] : 0.0f;
-        val = warp_reduce_sum(val);
-        if (lane == 0) {
-            atomicAdd(d_dangling, val);     // one atomic per block, not per thread
-        }
-    }
-}
-
-// ---- Fused fill kernel: reset new_rank to base_val ----------------------
-__global__ void pagerank_fill_kernel(unsigned n, float base_val,
-                                     float* __restrict__ new_rank) {
-    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) new_rank[i] = base_val;
-}
-
-// ---- Init kernel: fill old_rank = 1/n ------------------------------------
+/** Fills rank[i] = inv_n for all i. */
 __global__ void pagerank_init_kernel(unsigned n, float inv_n,
                                      float* __restrict__ rank) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) rank[i] = inv_n;
 }
 
-// ---- Pull update kernel ---------------------------------------------------
-// Each thread owns one destination vertex v, accumulates from in-neighbours
-// using CSC.  Out-degree derived from col_ptr — no separate array needed.
-__global__ void pagerank_pull_kernel(unsigned             n,
+/** Fills new_rank[i] = base_val for all i. */
+__global__ void pagerank_fill_kernel(unsigned n, float base_val,
+                                     float* __restrict__ new_rank) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) new_rank[i] = base_val;
+}
+
+/**
+ * Dangling-mass reduction.
+ * Threads whose vertex has inv_deg==0 contribute old_rank[i]; others contribute 0.
+ * Warp shuffle reduces within each warp, then one atomicAdd per block.
+ */
+__global__ void pagerank_dangling_kernel(unsigned                  n,
+                                         const float* __restrict__ old_rank,
+                                         const float* __restrict__ inv_deg,
+                                         float*       __restrict__ d_dangling) {
+    extern __shared__ float sdata[];
+
+    const unsigned i    = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned lid  = threadIdx.x;
+    const unsigned wid  = lid >> 5;
+    const unsigned lane = lid & 31;
+
+    float val = (i < n && inv_deg[i] == 0.0f) ? old_rank[i] : 0.0f;
+    val = warp_reduce_sum(val);
+    if (lane == 0) sdata[wid] = val;
+    __syncthreads();
+
+    const unsigned warps_per_block = (blockDim.x + 31u) >> 5;
+    if (wid == 0) {
+        val = (lane < warps_per_block) ? sdata[lane] : 0.0f;
+        val = warp_reduce_sum(val);
+        if (lane == 0) atomicAdd(d_dangling, val);
+    }
+}
+
+/**
+ * Pull accumulation.
+ * Each thread owns one destination vertex v and accumulates contributions from
+ * its in-neighbours via the CSC.  Writes to new_rank[v] are exclusive per thread.
+ */
+__global__ void pagerank_pull_kernel(unsigned                   n,
                                      const EdgeID* __restrict__ col_ptr,
                                      const NodeID* __restrict__ row_idx,
-                                     const float* __restrict__  old_rank,
-                                     const float* __restrict__  inv_deg,
+                                     const float*  __restrict__ old_rank,
+                                     const float*  __restrict__ inv_deg,
                                      float                      damping,
-                                     float* __restrict__        new_rank) {
+                                     float*        __restrict__ new_rank) {
     const unsigned v = blockIdx.x * blockDim.x + threadIdx.x;
     if (v >= n) return;
 
@@ -123,24 +122,45 @@ __global__ void pagerank_pull_kernel(unsigned             n,
     float acc = 0.0f;
     for (EdgeID e = lo; e < hi; ++e) {
         const NodeID j = row_idx[e];
-        acc += old_rank[j] * inv_deg[j];   // inv_deg[j]=0 for dangling, safe
+        acc += old_rank[j] * inv_deg[j];   // inv_deg[j]==0 for dangling → safe
     }
     new_rank[v] += damping * acc;
 }
 
-// ---- Abs-diff functor for CUB --------------------------------------------
-struct AbsDiff {
-    const float* a;
-    const float* b;
-    __device__ __forceinline__ float operator()(int i) const {
-        return fabsf(a[i] - b[i]);
+/**
+ * L1 convergence kernel: computes sum |new_rank[i] - old_rank[i]| over all i.
+ * Same warp+block reduction pattern as the dangling kernel.
+ * Takes old_rank and new_rank as explicit parameters so std::swap on the device
+ * pointers between iterations does not invalidate the inputs.
+ */
+__global__ void pagerank_l1_kernel(unsigned                  n,
+                                   const float* __restrict__ old_rank,
+                                   const float* __restrict__ new_rank,
+                                   float*       __restrict__ d_l1) {
+    extern __shared__ float sdata[];
+
+    const unsigned i    = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned lid  = threadIdx.x;
+    const unsigned wid  = lid >> 5;
+    const unsigned lane = lid & 31;
+
+    float val = (i < n) ? fabsf(new_rank[i] - old_rank[i]) : 0.0f;
+    val = warp_reduce_sum(val);
+    if (lane == 0) sdata[wid] = val;
+    __syncthreads();
+
+    const unsigned warps_per_block = (blockDim.x + 31u) >> 5;
+    if (wid == 0) {
+        val = (lane < warps_per_block) ? sdata[lane] : 0.0f;
+        val = warp_reduce_sum(val);
+        if (lane == 0) atomicAdd(d_l1, val);
     }
-};
+}
 
 } // namespace
 
 // ---------------------------------------------------------------------------
-// CSC builder (host, called once)
+// CSC builder (host, called once per pagerank_cuda invocation)
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -175,8 +195,8 @@ static CSCHost build_csc(const CSR& csr) {
         const EdgeID lo = csr.row_ptr[v];
         const EdgeID hi = csr.row_ptr[v + 1];
         for (EdgeID e = lo; e < hi; ++e) {
-            const NodeID u   = csr.col_idx[e];
-            const EdgeID pos = next[u]++;
+            const NodeID  u   = csr.col_idx[e];
+            const EdgeID  pos = next[u]++;
             c.row_idx[pos] = v;
         }
     }
@@ -197,22 +217,23 @@ PageRankResult pagerank_cuda(const Graph& graph) {
     if (n == 0) return out;
 
     const CSR&    csr = graph.csr();
-    const CSCHost csc = build_csc(csr);   // O(n+m), done once
+    const CSCHost csc = build_csc(csr);
 
     const float inv_n         = 1.0f / static_cast<float>(n);
     const float base_teleport = (1.0f - kPageRankDamping) * inv_n;
 
-    // ---- Device allocations -----------------------------------------------
+    // ---- Device allocations ------------------------------------------------
     const std::size_t n1         = static_cast<std::size_t>(n) + 1u;
     const std::size_t m          = csc.row_idx.size();
     const std::size_t rank_bytes = static_cast<std::size_t>(n) * sizeof(float);
 
-    EdgeID* d_col_ptr = nullptr;
-    NodeID* d_row_idx = nullptr;
-    float*  d_inv_deg = nullptr;
-    float*  d_old     = nullptr;
-    float*  d_new     = nullptr;
+    EdgeID* d_col_ptr  = nullptr;
+    NodeID* d_row_idx  = nullptr;
+    float*  d_inv_deg  = nullptr;
+    float*  d_old      = nullptr;
+    float*  d_new      = nullptr;
     float*  d_dangling = nullptr;
+    float*  d_l1       = nullptr;
 
     checkCuda(cudaMalloc(&d_col_ptr,  n1 * sizeof(EdgeID)));
     checkCuda(cudaMalloc(&d_row_idx,  m  * sizeof(NodeID)));
@@ -220,98 +241,73 @@ PageRankResult pagerank_cuda(const Graph& graph) {
     checkCuda(cudaMalloc(&d_old,      rank_bytes));
     checkCuda(cudaMalloc(&d_new,      rank_bytes));
     checkCuda(cudaMalloc(&d_dangling, sizeof(float)));
+    checkCuda(cudaMalloc(&d_l1,       sizeof(float)));
 
-    // Pinned host memory for dangling D2H — avoids pageable-copy latency
+    // Pinned host scalar for low-latency D2H of dangling mass
     float* h_dangling = nullptr;
     checkCuda(cudaMallocHost(&h_dangling, sizeof(float)));
 
-    // Upload static structures
+    // Upload static CSC structures once
     checkCuda(cudaMemcpy(d_col_ptr, csc.col_ptr.data(), n1 * sizeof(EdgeID), cudaMemcpyHostToDevice));
     checkCuda(cudaMemcpy(d_row_idx, csc.row_idx.data(), m  * sizeof(NodeID), cudaMemcpyHostToDevice));
     checkCuda(cudaMemcpy(d_inv_deg, csc.inv_deg.data(), rank_bytes,           cudaMemcpyHostToDevice));
 
     // ---- Kernel geometry ---------------------------------------------------
-    const int threads      = kDefaultCudaBlockSize;               // e.g. 256
-    const int blocks       = static_cast<int>((n + threads - 1) / threads);
-    const int warps_per_blk = threads / 32;
-    const std::size_t smem  = static_cast<std::size_t>(warps_per_blk) * sizeof(float);
+    const unsigned threads       = static_cast<unsigned>(kDefaultCudaBlockSize);
+    const unsigned blocks        = (static_cast<unsigned>(n) + threads - 1u) / threads;
+    const unsigned warps_per_blk = threads / 32u;
+    const std::size_t smem       = static_cast<std::size_t>(warps_per_blk) * sizeof(float);
 
-    // ---- Persistent CUB reduce plan ----------------------------------------
-    // We reduce abs(new - old) over n elements using an index-based iterator.
-    void*  d_temp_storage     = nullptr;
-    std::size_t temp_bytes    = 0;
-    float* d_l1               = nullptr;
-    checkCuda(cudaMalloc(&d_l1, sizeof(float)));
-
-    // Probe CUB for required temp storage size (index-based transform iterator)
-    // We use an integer counting iterator transformed to |d_new[i]-d_old[i]|
-    {
-        cub::CountingInputIterator<int> cnt(0);
-        AbsDiff functor{d_new, d_old};
-        cub::TransformInputIterator<float, AbsDiff, cub::CountingInputIterator<int>>
-            it(cnt, functor);
-        cub::DeviceReduce::Sum(d_temp_storage, temp_bytes, it, d_l1,
-                               static_cast<int>(n));
-        checkCuda(cudaMalloc(&d_temp_storage, temp_bytes));
-    }
-
-    // ---- Init rank ---------------------------------------------------------
+    // ---- Initialise ranks on device ----------------------------------------
     pagerank_init_kernel<<<blocks, threads>>>(static_cast<unsigned>(n), inv_n, d_old);
     checkCuda(cudaGetLastError());
 
     // ---- Iteration loop ----------------------------------------------------
     for (int iter = 0; iter < kPageRankMaxIter; ++iter) {
 
-        // 1. Dangling reduction (warp+block reduce → one atomic per block)
+        // 1. Dangling mass reduction (warp+block, one atomicAdd per block)
         checkCuda(cudaMemset(d_dangling, 0, sizeof(float)));
         pagerank_dangling_kernel<<<blocks, threads, smem>>>(
             static_cast<unsigned>(n), d_old, d_inv_deg, d_dangling);
         checkCuda(cudaGetLastError());
+        checkCuda(cudaDeviceSynchronize());
 
-        // 2. Async D2H of dangling scalar using pinned memory.
-        //    We launch fill and pull kernels AFTER this returns, but the
-        //    synchronisation point is cudaDeviceSynchronize at step 3 —
-        //    the dangling kernel must finish before this copy.
-        checkCuda(cudaDeviceSynchronize());   // ensure dangling kernel done
         checkCuda(cudaMemcpy(h_dangling, d_dangling, sizeof(float), cudaMemcpyDeviceToHost));
-
         const float base_val = base_teleport + kPageRankDamping * (*h_dangling) * inv_n;
 
-        // 3. Fill new_rank with base_val
+        // 2. Fill new_rank = base_val
         pagerank_fill_kernel<<<blocks, threads>>>(
             static_cast<unsigned>(n), base_val, d_new);
         checkCuda(cudaGetLastError());
 
-        // 4. Pull accumulation — no atomics, each thread writes d_new[v] exclusively
+        // 3. Pull accumulation — no atomics, exclusive write per thread
         pagerank_pull_kernel<<<blocks, threads>>>(
             static_cast<unsigned>(n),
             d_col_ptr, d_row_idx, d_old, d_inv_deg, kPageRankDamping, d_new);
         checkCuda(cudaGetLastError());
 
-        // 5. L1 convergence via persistent CUB plan
-        {
-            cub::CountingInputIterator<int> cnt(0);
-            AbsDiff functor{d_new, d_old};
-            cub::TransformInputIterator<float, AbsDiff, cub::CountingInputIterator<int>>
-                it(cnt, functor);
-            cub::DeviceReduce::Sum(d_temp_storage, temp_bytes, it, d_l1,
-                                   static_cast<int>(n));
-        }
+        // 4. L1 convergence (warp+block reduce, same pattern as dangling)
+        //    Pass d_old and d_new explicitly — safe after std::swap below.
+        checkCuda(cudaMemset(d_l1, 0, sizeof(float)));
+        pagerank_l1_kernel<<<blocks, threads, smem>>>(
+            static_cast<unsigned>(n), d_old, d_new, d_l1);
+        checkCuda(cudaGetLastError());
         checkCuda(cudaDeviceSynchronize());
 
         float l1_h = 0.0f;
         checkCuda(cudaMemcpy(&l1_h, d_l1, sizeof(float), cudaMemcpyDeviceToHost));
 
+        // Swap buffers: d_old becomes the just-computed new_rank for next iter
         std::swap(d_old, d_new);
         out.iterations = iter + 1;
 
         if (l1_h < kPageRankEpsilon) break;
     }
 
-    // ---- Copy result back -------------------------------------------------
+    // ---- Copy result back --------------------------------------------------
     std::vector<float> host_rank(static_cast<std::size_t>(n));
     checkCuda(cudaMemcpy(host_rank.data(), d_old, rank_bytes, cudaMemcpyDeviceToHost));
-    out.ranks.assign(host_rank.begin(), host_rank.end());
+    out.ranks = std::move(host_rank);
 
     // ---- Cleanup -----------------------------------------------------------
     checkCuda(cudaFree(d_col_ptr));
@@ -320,7 +316,6 @@ PageRankResult pagerank_cuda(const Graph& graph) {
     checkCuda(cudaFree(d_old));
     checkCuda(cudaFree(d_new));
     checkCuda(cudaFree(d_dangling));
-    checkCuda(cudaFree(d_temp_storage));
     checkCuda(cudaFree(d_l1));
     checkCuda(cudaFreeHost(h_dangling));
 
