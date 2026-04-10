@@ -11,11 +11,19 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_ARCHITECTURES 75)
 
+# ── CUDAToolkit MUST come before any target_link_libraries that reference
+#    CUDA::cudart. find_package(CUDAToolkit) is what creates that imported target.
+find_package(CUDAToolkit REQUIRED)
 find_package(OpenMP REQUIRED)
 
+# ── Collect the CUDA include path so g++-compiled .cpp files that transitively
+#    include common.h (which guards cuda_runtime.h behind GRAPH_ENGINE_BUILD_CUDA)
+#    can still locate the header when the definition is set.
+#    CUDAToolkit_INCLUDE_DIRS is populated by find_package(CUDAToolkit).
 set(ENGINE_INCLUDES
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/src
+    ${CUDAToolkit_INCLUDE_DIRS}
 )
 
 set(ENGINE_SOURCES
@@ -37,6 +45,9 @@ set(ENGINE_CUDA_SOURCES
     src/algorithms/wcc/wcc_cuda.cu
 )
 
+# ─────────────────────────────────────────────
+#  Target: graph_engine
+# ─────────────────────────────────────────────
 add_executable(graph_engine
     src/main.cpp
     ${ENGINE_SOURCES}
@@ -63,12 +74,12 @@ target_compile_options(graph_engine PRIVATE
 
 target_link_libraries(graph_engine PRIVATE
     OpenMP::OpenMP_CXX
+    CUDA::cudart
 )
 
-if (CMAKE_CUDA_COMPILER)
-    target_link_libraries(graph_engine PRIVATE CUDA::cudart)
-endif()
-
+# ─────────────────────────────────────────────
+#  Target: benchmark_runner
+# ─────────────────────────────────────────────
 add_executable(benchmark_runner
     benchmarks/benchmark_runner.cpp
     ${ENGINE_SOURCES}
@@ -95,12 +106,10 @@ target_compile_options(benchmark_runner PRIVATE
 
 target_link_libraries(benchmark_runner PRIVATE
     OpenMP::OpenMP_CXX
+    CUDA::cudart
 )
 
-if (CMAKE_CUDA_COMPILER)
-    target_link_libraries(benchmark_runner PRIVATE CUDA::cudart)
-endif()
-
+# Link stdc++fs for GCC < 9.1 (std::filesystem was experimental there)
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.1)
     target_link_libraries(benchmark_runner PRIVATE stdc++fs)
 endif()
