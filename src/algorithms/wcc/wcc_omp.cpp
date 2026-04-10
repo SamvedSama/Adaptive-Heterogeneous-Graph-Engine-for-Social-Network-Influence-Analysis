@@ -1,46 +1,113 @@
 /**
  * @file wcc_omp.cpp
- * @brief Parallel weakly connected components via Jacobi label propagation on a
- *        symmetric adjacency built from directed edges (each arc yields mutual reachability).
+ * @brief Parallel weakly connected components via a concurrent union–find
+ *        with atomic path compression (Jayanti–Tarjan style).
+ *
+ * Why the original approach was wrong
+ * ------------------------------------
+ * The original used Jacobi label propagation (min-label spreading) with a
+ * convergence bound of `8*n` iterations.  This has two serious flaws:
+ *
+ *  1. CORRECTNESS: Jacobi propagation on the SYMMETRIC adjacency needs O(diameter)
+ *     iterations to converge.  For a path graph of n nodes the diameter is n-1,
+ *     making the `8*n` bound technically safe but the "3 extra sweeps" post-loop
+ *     is NOT a valid correctness guarantee — if the main loop exits at max_iters
+ *     before true convergence, the 3 extra sweeps can leave wrong labels.
+ *
+ *  2. PERFORMANCE: Building a full symmetric adjacency list (vector-of-vectors)
+ *     doubles memory, fragments the heap, and the sort+unique per vertex adds
+ *     O(E log E) work before any WCC logic begins.
+ *
+ * Production approach: parallel union–find (Iyer et al. / Anderson & Wenger style)
+ * ----------------------------------------------------------------------------------
+ * We use a shared `parent[]` array of std::atomic<NodeID> and implement
+ * concurrent `find` (with atomic path compression) and `unite` (with CAS-based
+ * linking).  This is correct by construction — no iteration bound needed — and
+ * works directly on the CSR without building a symmetric copy.
+ *
+ * Algorithm sketch
+ * ----------------
+ *  - Initialise parent[v] = v for all v (each node is its own root).
+ *  - In parallel, for each directed edge (v → u), call unite(v, u).
+ *    Because we call unite for BOTH directions implicitly (every directed edge
+ *    is treated as undirected), weak connectivity is captured.
+ *  - find() uses iterative path splitting (Rem's algorithm) which is safe for
+ *    concurrent access without locks and keeps chains short.
+ *  - unite() uses a CAS loop to attach the larger root under the smaller root.
+ *
+ * Compatibility: C++17, OpenMP 3.0+, same BfsResult / Graph / CSR types.
  */
 #include "graph/graph.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <numeric>
+#include <unordered_map>
 #include <vector>
 #include <omp.h>
 
+namespace {
+
+// ---------------------------------------------------------------------------
+// Concurrent union–find over std::atomic<NodeID>
+// ---------------------------------------------------------------------------
+
 /**
- * @brief Builds an undirected adjacency list from the CSR so weak connectivity is captured.
+ * @brief Finds the root of x using iterative path splitting (Rem's algorithm).
+ *        Path splitting is safe under concurrent access: each node's parent
+ *        pointer only ever moves closer to the root, so stale reads are harmless.
  */
-static void build_symmetric_adj(const CSR& csr, std::vector<std::vector<NodeID>>& adj) {
-    const NodeID n = csr.num_nodes;
-    adj.assign(static_cast<std::size_t>(n), {});
-
-    for (NodeID v = 0; v < n; ++v) {
-        const EdgeID lo = csr.row_ptr[v];
-        const EdgeID hi = csr.row_ptr[v + 1];
-        for (EdgeID e = lo; e < hi; ++e) {
-            const NodeID u = csr.col_idx[static_cast<std::size_t>(e)];
-            if (u == v) {
-                continue;
-            }
-            adj[v].push_back(u);
-            adj[u].push_back(v);
+NodeID find_root(const std::vector<std::atomic<NodeID>>& parent, NodeID x) {
+    while (true) {
+        const NodeID p  = parent[x].load(std::memory_order_relaxed);
+        const NodeID gp = parent[p].load(std::memory_order_relaxed);
+        if (p == gp) {
+            return p;   // p is a root
         }
-    }
-
-#pragma omp parallel for schedule(dynamic, 32)
-    for (std::ptrdiff_t vi = 0; vi < static_cast<std::ptrdiff_t>(n); ++vi) {
-        auto& nb = adj[static_cast<std::size_t>(vi)];
-        std::sort(nb.begin(), nb.end());
-        nb.erase(std::unique(nb.begin(), nb.end()), nb.end());
+        // Path splitting: make x point to its grandparent (best-effort, may fail)
+        parent[x].compare_exchange_weak(
+            const_cast<NodeID&>(p), gp,
+            std::memory_order_relaxed, std::memory_order_relaxed);
+        x = p;
     }
 }
 
 /**
- * @brief Propagates the minimum neighbor label in parallel until a full sweep causes no change.
+ * @brief Unites the components containing a and b.
+ *        Links the larger root ID under the smaller root ID (min-root convention)
+ *        using a CAS loop to resolve races.
  */
+void unite(std::vector<std::atomic<NodeID>>& parent, NodeID a, NodeID b) {
+    while (true) {
+        NodeID ra = find_root(parent, a);
+        NodeID rb = find_root(parent, b);
+
+        if (ra == rb) {
+            return;   // already in the same component
+        }
+
+        // Canonical ordering: attach larger root under smaller root
+        if (ra > rb) {
+            std::swap(ra, rb);
+        }
+
+        // CAS: try to set parent[rb] = ra (rb was a root, i.e. parent[rb] == rb)
+        NodeID expected = rb;
+        if (parent[rb].compare_exchange_strong(
+                expected, ra,
+                std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return;   // succeeded
+        }
+        // Another thread modified parent[rb] — retry from the top
+    }
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
 WccResult wcc_openmp(const Graph& graph, bool verbose) {
     const NodeID n = graph.num_nodes();
     WccResult out;
@@ -55,84 +122,66 @@ WccResult wcc_openmp(const Graph& graph, bool verbose) {
     }
 
     const CSR& csr = graph.csr();
-    std::vector<std::vector<NodeID>> adj;
-    build_symmetric_adj(csr, adj);
 
-    std::vector<NodeID> label(static_cast<std::size_t>(n));
-    std::vector<NodeID> next_label(static_cast<std::size_t>(n));
+    // ---- Initialise atomic parent array ------------------------------------
+    std::vector<std::atomic<NodeID>> parent(static_cast<std::size_t>(n));
 
 #pragma omp parallel for schedule(static)
-    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
-        label[static_cast<std::size_t>(i)] = static_cast<NodeID>(i);
+    for (std::ptrdiff_t v = 0; v < static_cast<std::ptrdiff_t>(n); ++v) {
+        parent[static_cast<std::size_t>(v)].store(
+            static_cast<NodeID>(v), std::memory_order_relaxed);
     }
 
-    bool changed = true;
-    int iters = 0;
-    /** High enough for long paths; Jacobi updates admit a slow diameter worst case. */
-    const int max_iters = static_cast<int>(8 * n + 128);
-
-    while (changed && iters < max_iters) {
-        changed = false;
-
-#pragma omp parallel for schedule(guided) reduction(|| : changed)
-        for (std::ptrdiff_t vi = 0; vi < static_cast<std::ptrdiff_t>(n); ++vi) {
-            const NodeID v = static_cast<NodeID>(vi);
-            NodeID best = label[v];
-            for (NodeID u : adj[static_cast<std::size_t>(v)]) {
-                best = std::min(best, label[u]);
-            }
-            next_label[v] = best;
-            if (best != label[v]) {
-                changed = true;
+    // ---- Parallel union over all directed edges ----------------------------
+    // Each directed edge (v → u) is treated as undirected for weak connectivity.
+    // We do NOT need to build a symmetric copy: unite(v, u) == unite(u, v).
+#pragma omp parallel for schedule(guided)
+    for (std::ptrdiff_t vi = 0; vi < static_cast<std::ptrdiff_t>(n); ++vi) {
+        const NodeID v   = static_cast<NodeID>(vi);
+        const EdgeID lo  = csr.row_ptr[v];
+        const EdgeID hi  = csr.row_ptr[v + 1];
+        for (EdgeID e = lo; e < hi; ++e) {
+            const NodeID u = csr.col_idx[static_cast<std::size_t>(e)];
+            if (u != v) {
+                unite(parent, v, u);
             }
         }
-
-        label.swap(next_label);
-        ++iters;
     }
 
-    // Final convergence pass without races: freeze labels and pull min neighbor again
-    for (int sweep = 0; sweep < 3; ++sweep) {
-#pragma omp parallel for schedule(static)
-        for (std::ptrdiff_t vi = 0; vi < static_cast<std::ptrdiff_t>(n); ++vi) {
-            const NodeID v = static_cast<NodeID>(vi);
-            NodeID best = label[v];
-            for (NodeID u : adj[static_cast<std::size_t>(v)]) {
-                best = std::min(best, label[u]);
-            }
-            next_label[v] = best;
-        }
-        label.swap(next_label);
+    // ---- Final root compression (sequential, cheap) ------------------------
+    // After all unions, some nodes may still point at intermediate nodes rather
+    // than the true root.  One sequential pass of iterative find fixes this.
+    for (NodeID v = 0; v < n; ++v) {
+        const NodeID root = find_root(parent, v);
+        parent[v].store(root, std::memory_order_relaxed);
+        out.component_id[v] = root;
     }
 
-    out.component_id = label;
+    // ---- Count component sizes in O(n) -------------------------------------
+    std::unordered_map<NodeID, int> size_map;
+    size_map.reserve(static_cast<std::size_t>(n));
+    for (NodeID v = 0; v < n; ++v) {
+        ++size_map[out.component_id[v]];
+    }
 
-    std::vector<NodeID> roots = label;
-    std::sort(roots.begin(), roots.end());
-    for (std::size_t i = 0; i < roots.size();) {
-        std::size_t j = i;
-        while (j < roots.size() && roots[j] == roots[i]) {
-            ++j;
-        }
-        out.component_sizes.push_back({roots[i], static_cast<int>(j - i)});
-        i = j;
+    out.component_sizes.reserve(size_map.size());
+    for (const auto& [root, sz] : size_map) {
+        out.component_sizes.push_back({root, sz});
     }
 
     std::sort(out.component_sizes.begin(), out.component_sizes.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
 
-    const int num_comp = static_cast<int>(out.component_sizes.size());
-    const int largest = out.component_sizes.empty() ? 0 : out.component_sizes.front().second;
-
     if (verbose) {
-        std::printf("WCC (OpenMP): components=%d largest=%d nodes (propagation_iters=%d)\n", num_comp,
-                    largest, iters);
+        const int num_comp = static_cast<int>(out.component_sizes.size());
+        const int largest  = out.component_sizes.front().second;
+        std::printf("WCC (OpenMP): components=%d  largest=%d nodes\n",
+                    num_comp, largest);
         std::printf("  Size distribution (top 8): ");
-        const int kShow = std::min(8, static_cast<int>(out.component_sizes.size()));
+        const int kShow = std::min(8, num_comp);
         for (int t = 0; t < kShow; ++t) {
-            std::printf("%u:%d ",
-                        static_cast<unsigned>(out.component_sizes[static_cast<std::size_t>(t)].first),
-                        out.component_sizes[static_cast<std::size_t>(t)].second);
+            const auto& [root, sz] = out.component_sizes[static_cast<std::size_t>(t)];
+            std::printf("%u:%d ", static_cast<unsigned>(root), sz);
         }
         std::printf("\n");
     }
