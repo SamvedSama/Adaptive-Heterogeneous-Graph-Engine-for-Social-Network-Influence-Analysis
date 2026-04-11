@@ -47,87 +47,101 @@
 #include <vector>
 #include <omp.h>
 
-namespace {
+namespace
+{
 
-// ---------------------------------------------------------------------------
-// Concurrent union–find over std::atomic<NodeID>
-// ---------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
+    // Concurrent union–find over std::atomic<NodeID>
+    // ---------------------------------------------------------------------------
 
-/**
- * @brief Finds the root of x using iterative path splitting (Rem's algorithm).
- *        Path splitting is safe under concurrent access: each node's parent
- *        pointer only ever moves closer to the root, so stale reads are harmless.
- */
-NodeID find_root(const std::vector<std::atomic<NodeID>>& parent, NodeID x) {
-    while (true) {
-        const NodeID p  = parent[x].load(std::memory_order_relaxed);
-        const NodeID gp = parent[p].load(std::memory_order_relaxed);
-        if (p == gp) {
-            return p;   // p is a root
+    /**
+     * @brief Finds the root of x using iterative path splitting (Rem's algorithm).
+     *        Path splitting is safe under concurrent access: each node's parent
+     *        pointer only ever moves closer to the root, so stale reads are harmless.
+     */
+    NodeID find_root(std::vector<std::atomic<NodeID>> &parent, NodeID x)
+    {
+        while (true)
+        {
+            const NodeID p = parent[x].load(std::memory_order_relaxed);
+            const NodeID gp = parent[p].load(std::memory_order_relaxed);
+            if (p == gp)
+            {
+                return p; // p is a root
+            }
+            // Path splitting: make x point to its grandparent (best-effort, may fail)
+            NodeID expected = p;
+            parent[x].compare_exchange_weak(
+                expected, gp,
+                std::memory_order_relaxed, std::memory_order_relaxed);
+            x = p;
         }
-        // Path splitting: make x point to its grandparent (best-effort, may fail)
-        parent[x].compare_exchange_weak(
-            const_cast<NodeID&>(p), gp,
-            std::memory_order_relaxed, std::memory_order_relaxed);
-        x = p;
     }
-}
 
-/**
- * @brief Unites the components containing a and b.
- *        Links the larger root ID under the smaller root ID (min-root convention)
- *        using a CAS loop to resolve races.
- */
-void unite(std::vector<std::atomic<NodeID>>& parent, NodeID a, NodeID b) {
-    while (true) {
-        NodeID ra = find_root(parent, a);
-        NodeID rb = find_root(parent, b);
+    /**
+     * @brief Unites the components containing a and b.
+     *        Links the larger root ID under the smaller root ID (min-root convention)
+     *        using a CAS loop to resolve races.
+     */
+    void unite(std::vector<std::atomic<NodeID>> &parent, NodeID a, NodeID b)
+    {
+        while (true)
+        {
+            NodeID ra = find_root(parent, a);
+            NodeID rb = find_root(parent, b);
 
-        if (ra == rb) {
-            return;   // already in the same component
+            if (ra == rb)
+            {
+                return; // already in the same component
+            }
+
+            // Canonical ordering: attach larger root under smaller root
+            if (ra > rb)
+            {
+                std::swap(ra, rb);
+            }
+
+            // CAS: try to set parent[rb] = ra (rb was a root, i.e. parent[rb] == rb)
+            NodeID expected = rb;
+            if (parent[rb].compare_exchange_strong(
+                    expected, ra,
+                    std::memory_order_relaxed, std::memory_order_relaxed))
+            {
+                return; // succeeded
+            }
+            // Another thread modified parent[rb] — retry from the top
         }
-
-        // Canonical ordering: attach larger root under smaller root
-        if (ra > rb) {
-            std::swap(ra, rb);
-        }
-
-        // CAS: try to set parent[rb] = ra (rb was a root, i.e. parent[rb] == rb)
-        NodeID expected = rb;
-        if (parent[rb].compare_exchange_strong(
-                expected, ra,
-                std::memory_order_relaxed, std::memory_order_relaxed)) {
-            return;   // succeeded
-        }
-        // Another thread modified parent[rb] — retry from the top
     }
-}
 
 } // namespace
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
-WccResult wcc_openmp(const Graph& graph, bool verbose) {
+WccResult wcc_openmp(const Graph &graph, bool verbose)
+{
     const NodeID n = graph.num_nodes();
     WccResult out;
     out.component_id.assign(static_cast<std::size_t>(n), 0);
     out.component_sizes.clear();
 
-    if (n == 0) {
-        if (verbose) {
+    if (n == 0)
+    {
+        if (verbose)
+        {
             std::printf("WCC (OpenMP): 0 components (empty graph)\n");
         }
         return out;
     }
 
-    const CSR& csr = graph.csr();
+    const CSR &csr = graph.csr();
 
     // ---- Initialise atomic parent array ------------------------------------
     std::vector<std::atomic<NodeID>> parent(static_cast<std::size_t>(n));
 
 #pragma omp parallel for schedule(static)
-    for (std::ptrdiff_t v = 0; v < static_cast<std::ptrdiff_t>(n); ++v) {
+    for (std::ptrdiff_t v = 0; v < static_cast<std::ptrdiff_t>(n); ++v)
+    {
         parent[static_cast<std::size_t>(v)].store(
             static_cast<NodeID>(v), std::memory_order_relaxed);
     }
@@ -136,13 +150,16 @@ WccResult wcc_openmp(const Graph& graph, bool verbose) {
     // Each directed edge (v → u) is treated as undirected for weak connectivity.
     // We do NOT need to build a symmetric copy: unite(v, u) == unite(u, v).
 #pragma omp parallel for schedule(guided)
-    for (std::ptrdiff_t vi = 0; vi < static_cast<std::ptrdiff_t>(n); ++vi) {
-        const NodeID v   = static_cast<NodeID>(vi);
-        const EdgeID lo  = csr.row_ptr[v];
-        const EdgeID hi  = csr.row_ptr[v + 1];
-        for (EdgeID e = lo; e < hi; ++e) {
+    for (std::ptrdiff_t vi = 0; vi < static_cast<std::ptrdiff_t>(n); ++vi)
+    {
+        const NodeID v = static_cast<NodeID>(vi);
+        const EdgeID lo = csr.row_ptr[v];
+        const EdgeID hi = csr.row_ptr[v + 1];
+        for (EdgeID e = lo; e < hi; ++e)
+        {
             const NodeID u = csr.col_idx[static_cast<std::size_t>(e)];
-            if (u != v) {
+            if (u != v)
+            {
                 unite(parent, v, u);
             }
         }
@@ -151,7 +168,8 @@ WccResult wcc_openmp(const Graph& graph, bool verbose) {
     // ---- Final root compression (sequential, cheap) ------------------------
     // After all unions, some nodes may still point at intermediate nodes rather
     // than the true root.  One sequential pass of iterative find fixes this.
-    for (NodeID v = 0; v < n; ++v) {
+    for (NodeID v = 0; v < n; ++v)
+    {
         const NodeID root = find_root(parent, v);
         parent[v].store(root, std::memory_order_relaxed);
         out.component_id[v] = root;
@@ -160,27 +178,32 @@ WccResult wcc_openmp(const Graph& graph, bool verbose) {
     // ---- Count component sizes in O(n) -------------------------------------
     std::unordered_map<NodeID, int> size_map;
     size_map.reserve(static_cast<std::size_t>(n));
-    for (NodeID v = 0; v < n; ++v) {
+    for (NodeID v = 0; v < n; ++v)
+    {
         ++size_map[out.component_id[v]];
     }
 
     out.component_sizes.reserve(size_map.size());
-    for (const auto& [root, sz] : size_map) {
+    for (const auto &[root, sz] : size_map)
+    {
         out.component_sizes.push_back({root, sz});
     }
 
     std::sort(out.component_sizes.begin(), out.component_sizes.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
+              [](const auto &a, const auto &b)
+              { return a.second > b.second; });
 
-    if (verbose) {
+    if (verbose)
+    {
         const int num_comp = static_cast<int>(out.component_sizes.size());
-        const int largest  = out.component_sizes.front().second;
+        const int largest = out.component_sizes.front().second;
         std::printf("WCC (OpenMP): components=%d  largest=%d nodes\n",
                     num_comp, largest);
         std::printf("  Size distribution (top 8): ");
         const int kShow = std::min(8, num_comp);
-        for (int t = 0; t < kShow; ++t) {
-            const auto& [root, sz] = out.component_sizes[static_cast<std::size_t>(t)];
+        for (int t = 0; t < kShow; ++t)
+        {
+            const auto &[root, sz] = out.component_sizes[static_cast<std::size_t>(t)];
             std::printf("%u:%d ", static_cast<unsigned>(root), sz);
         }
         std::printf("\n");
