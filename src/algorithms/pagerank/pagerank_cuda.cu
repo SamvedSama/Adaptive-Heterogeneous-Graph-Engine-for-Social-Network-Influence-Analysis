@@ -32,6 +32,7 @@
 
 #include <cuda_runtime.h>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 // ---------------------------------------------------------------------------
